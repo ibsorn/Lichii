@@ -44,6 +44,10 @@ struct TranslationOptions {
 
     /// LSE atomics (not CASP) become AtomicRmwMemory/AtomicCasMemory (x64 backend only).
     bool native_lse_atomics = false;
+
+    /// Conditional branches leave the block through a side exit and translation goes on with the
+    /// next instruction, so values stay in host registers across them (superblocks, x64 backend only).
+    bool superblocks = false;
 };
 
 /**

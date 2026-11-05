@@ -341,6 +341,11 @@ struct UserConfig {
     /// of an exclusive load/store pair that ends the block.
     bool native_lse_atomics = false;
 
+    /// x64 only. Conditional branches (b.cond, cbz/cbnz, tbz/tbnz) leave the block through an
+    /// out-of-line side exit and translation goes on with the next instruction (superblocks), so
+    /// guest registers stay in host registers across them.
+    bool superblocks = false;
+
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define
     /// definite behaviour for some unpredictable instructions.

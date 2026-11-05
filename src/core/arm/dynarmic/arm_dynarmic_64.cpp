@@ -550,6 +550,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         static const bool native_atomics = Nx2EnvOn("EDEN_NX2_JIT_ATOMICS");
         config.native_lse_atomics = native_atomics && config.fastmem_exclusive_access &&
             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+        // Superblocks: conditional branches become side exits and translation goes on, so guest
+        // registers stay in host registers across them. EDEN_DYN_SUPERBLOCK=0 turns it off.
+        static const bool superblocks = Nx2EnvOn("EDEN_DYN_SUPERBLOCK");
+        config.superblocks = superblocks;
     }
 #endif
     m_jit.emplace(config);

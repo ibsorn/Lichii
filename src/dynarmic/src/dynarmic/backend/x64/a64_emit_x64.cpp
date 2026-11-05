@@ -176,8 +176,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
 #undef A64OPC
     };
 
+    bool has_side_exit = false;
     for (auto& inst : block.instructions) {
         auto const opcode = inst.GetOpcode();
+        has_side_exit |= opcode == IR::Opcode::A64SideExitIf || opcode == IR::Opcode::A64SideExitIfBit;
         // Call the relevant Emit* member function.
         switch (opcode) {
 #define OPCODE(name, type, ...) case IR::Opcode::name: goto opcode_branch;
@@ -215,12 +217,31 @@ finish_this_inst:
         if (flags_live)
             code.nzcv_live_pos = code.getCurr();
     }
+    // With halt_check_on_back_edges the indirect branch handlers already check for halts.
+    if (has_side_exit && !ctx.IsSingleStep() && !(conf.halt_check_on_back_edges && !conf.enable_cycle_counting)) {
+        // A superblock can be a loop body whose back edge is an indirect branch (ret, blr): those
+        // terminals never check for halts, the conditional branch that used to end the block did.
+        const auto* leaf = std::get_if<IR::Term::LeafTerminal>(&block.terminal);
+        if (leaf && (std::holds_alternative<IR::Term::FastDispatchHint>(*leaf) || std::holds_alternative<IR::Term::PopRSBHint>(*leaf))) {
+            if (conf.enable_cycle_counting) {
+                code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+                code.jle(code.GetForceReturnFromRunCodeAddress());
+            } else {
+                code.cmp(dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+                code.jne(code.GetForceReturnFromRunCodeAddress());
+            }
+        }
+    }
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.folded_address_adds.clear();
     code.nzcv_flags_pos = nullptr;
     code.nzcv_live_pos = nullptr;
     check_bit_in_zf = false;
     code.int3();
+    // Superblock side exits (near, like the block's own exits): they link to other blocks, so they
+    // go before the pending exit stubs are flushed and while emitting_block is still set.
+    for (auto& side_exit : ctx.side_exit_emits)
+        side_exit();
     const bool far_code = code.HasFarCode();
     if (far_code) {
         code.SwitchToFarCode();
@@ -385,6 +406,86 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
         return;
     }
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
+}
+
+void A64EmitX64::EmitSideExit(A64EmitContext& ctx, SharedLabel exit, u64 target, u64 cycles) {
+    // Out of line: the state is in memory (A64GetSetElimination keeps the sets before a side exit),
+    // and leaving the block lets the exit clobber any register.
+    // Emitted from ctx.side_exit_emits after the block's terminal, before the pending exit stubs
+    // are flushed (compact_block_exits adds a stub per unlinked target). The link is made from the
+    // block's own location, so halt_check_on_back_edges tells forward and backward links apart.
+    const IR::LocationDescriptor initial_location{ctx.Location().SetSingleStepping(false)};
+    const IR::LocationDescriptor next{A64::LocationDescriptor{ctx.Location()}.SetPC(target)};
+    ctx.side_exit_emits.emplace_back([this, exit, next, initial_location, cycles] {
+        code.L(*exit);
+        if (conf.enable_cycle_counting) {
+            EmitAddCycles(cycles);
+        }
+        if (!conf.omit_block_frame) {
+            code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+        }
+        EmitTerminal(IR::Term::LinkBlock{next}, initial_location, false);
+    });
+}
+
+void A64EmitX64::EmitA64SideExitIf(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const IR::Cond cond = args[0].GetImmediateCond();
+    const u64 target = args[1].GetImmediateU64();
+    const u64 cycles = args[2].GetImmediateU64();
+    SharedLabel exit = ctx.GenSharedLabel();
+    if (code.nzcv_live_pos != nullptr && code.nzcv_live_pos == code.getCurr()) {
+        // reuse_host_flags: the host flags still hold the guest NZCV with CF in ARM polarity, as
+        // after sahf (as in EmitCond).
+        if (cond == IR::Cond::HI || cond == IR::Cond::LS) {
+            code.cmc();
+        }
+        code.nzcv_live_pos = nullptr;
+    } else {
+        ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+        code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, cpsr_nzcv)]);
+        code.LoadRequiredFlagsForCondFromRax(cond);
+    }
+    switch (cond) {
+    case IR::Cond::EQ: code.jz(*exit, code.T_NEAR); break;
+    case IR::Cond::NE: code.jnz(*exit, code.T_NEAR); break;
+    case IR::Cond::CS: code.jc(*exit, code.T_NEAR); break;
+    case IR::Cond::CC: code.jnc(*exit, code.T_NEAR); break;
+    case IR::Cond::MI: code.js(*exit, code.T_NEAR); break;
+    case IR::Cond::PL: code.jns(*exit, code.T_NEAR); break;
+    case IR::Cond::VS: code.jo(*exit, code.T_NEAR); break;
+    case IR::Cond::VC: code.jno(*exit, code.T_NEAR); break;
+    case IR::Cond::HI: code.ja(*exit, code.T_NEAR); break;
+    case IR::Cond::LS: code.jna(*exit, code.T_NEAR); break;
+    case IR::Cond::GE: code.jge(*exit, code.T_NEAR); break;
+    case IR::Cond::LT: code.jl(*exit, code.T_NEAR); break;
+    case IR::Cond::GT: code.jg(*exit, code.T_NEAR); break;
+    case IR::Cond::LE: code.jle(*exit, code.T_NEAR); break;
+    default: UNREACHABLE();
+    }
+    EmitSideExit(ctx, exit, target, cycles);
+}
+
+void A64EmitX64::EmitA64SideExitIfBit(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const bool exit_when = args[1].GetImmediateU1();
+    const u64 target = args[2].GetImmediateU64();
+    const u64 cycles = args[3].GetImmediateU64();
+    SharedLabel exit = ctx.GenSharedLabel();
+    if (args[0].IsImmediate()) {
+        if (args[0].GetImmediateU1() == exit_when) {
+            code.jmp(*exit, code.T_NEAR);
+        }
+    } else {
+        const Xbyak::Reg8 bit = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
+        code.test(bit, bit);
+        if (exit_when) {
+            code.jnz(*exit, code.T_NEAR);
+        } else {
+            code.jz(*exit, code.T_NEAR);
+        }
+    }
+    EmitSideExit(ctx, exit, target, cycles);
 }
 
 void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {
