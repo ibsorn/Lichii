@@ -2139,12 +2139,17 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     const bool skip_buffers = fast_path && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
                               !device_memory.MayHaveArmedReadTraps(addr, size) &&
                               !Tegra::Nx2MayBeGpuWritten(addr, size);
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     if (!skip_textures) {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (texture_area) {
+        // The core disarmed the read's pages before asking: the buffer cache arms only pages it
+        // doesn't count as armed, so it must forget these.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(addr, size);
+        return *texture_area;
     }
     if (!skip_buffers && buffer_cache.FlushesOnCpuRead()) {
         std::scoped_lock lock{buffer_cache.mutex};
