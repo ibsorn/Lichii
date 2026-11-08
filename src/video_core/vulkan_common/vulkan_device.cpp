@@ -860,6 +860,8 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    // Recycled images may hold memory from a separate pool (MediumImages): free them first.
+    vk::ImageRecycler::Clear(allocator);
     for (auto& pools : separate_pools) {
         for (VmaPool pool : pools) {
             if (pool != VK_NULL_HANDLE) {
@@ -867,7 +869,6 @@ Device::~Device() {
             }
         }
     }
-    vk::ImageRecycler::Clear(allocator);
     vmaDestroyAllocator(allocator);
 }
 
@@ -878,7 +879,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::MediumImages ? MediumImagePoolBlockSize
+                                                            : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             // Guest buffers are read by most draws; sparse pages are textures (VMA's default).
