@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -74,6 +75,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_query_fast.h"
 
@@ -465,6 +467,29 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    // Ported from A-Man-With-A-Plan-dev/Eglantine 8705321017: submit while the front waits for
+    // the split back or the host GPU has run dry. EDEN_NX2_SUBMIT_WHILE_WAITED=0 turns it off.
+    submit_while_waited = [] {
+        const char* value = std::getenv("EDEN_NX2_SUBMIT_WHILE_WAITED");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (submit_while_waited) {
+        const auto draws = [](const char* name, u32 fallback) {
+            const char* value = std::getenv(name);
+            if (value == nullptr || value[0] < '0' || value[0] > '9') {
+                return fallback;
+            }
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            return *end == '\0' ? static_cast<u32>(std::clamp(parsed, 1UL, 1'048'576UL))
+                                : fallback;
+        };
+        submit_waited_draws = draws("EDEN_NX2_SUBMIT_WAITED_DRAWS", 64);
+        submit_idle_draws = draws("EDEN_NX2_SUBMIT_IDLE_DRAWS", 128);
+        LOG_INFO(Render_Vulkan,
+                 "submit_while_waited: {} draws while the front waits, {} once the GPU is idle",
+                 submit_waited_draws, submit_idle_draws);
+    }
     if (VideoCommon::Nx2WriteHandoff::Enabled()) {
         // Whoever takes or releases the buffer cache's lock first applies the guest write traps
         // queued while it was held, as each trap would have once it got the lock (OnCPUWrite).
@@ -3408,6 +3433,9 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
+    if (submit_while_waited) {
+        scheduler.NoteDraw();
+    }
     static const u32 native_budget = [] {
         if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
             if (const auto parsed = SubmissionPolicy::ParseBudget(value)) {
@@ -3430,6 +3458,11 @@ void RasterizerVulkan::FlushWork() {
         ++draw_counter;
         pending_native_work = true;
         if (draw_counter % 32 != 0 && draw_counter < native_budget) [[likely]] {
+            return;
+        }
+        if (submit_while_waited && draw_counter % 32 == 0 &&
+            VideoCommon::GpuSplit::OnBackThread() && SubmitWhileWaited()) {
+            draw_counter = 0;
             return;
         }
         if (draw_counter >= native_budget &&
@@ -3456,6 +3489,11 @@ void RasterizerVulkan::FlushWork() {
     case SubmissionPolicy::Action::None:
         break;
     case SubmissionPolicy::Action::Dispatch:
+        if (native && !android && submit_while_waited && VideoCommon::GpuSplit::OnBackThread() &&
+            SubmitWhileWaited()) {
+            draw_counter = 0;
+            break;
+        }
         scheduler.DispatchWork(true);
         break;
     case SubmissionPolicy::Action::Flush:
@@ -3466,6 +3504,37 @@ void RasterizerVulkan::FlushWork() {
     if (native && !android) {
         pending_native_work = true;
     }
+}
+
+bool RasterizerVulkan::SubmitWhileWaited() {
+    // A command list copy or a fence submitted later waits behind everything recorded since the
+    // last submission: the host GPU starts on it now while the front can't use the time, or the
+    // GPU would sit idle. The same commands in the same order; only the submissions move, at a
+    // draw boundary on the back, as fences and list copies already submit.
+    const u32 draws = scheduler.DrawsSinceSubmit();
+    if (!(draws >= submit_waited_draws && VideoCommon::GpuSplit::Get().FrontWaitsForBack()) &&
+        !(draws >= submit_idle_draws && scheduler.GpuCaughtUp())) {
+        return false;
+    }
+    if (!VideoCommon::Nx2Perf::Verify()) {
+        scheduler.Flush();
+        return true;
+    }
+    // No answer to compare: the submission must end the pass and advance one tick, as any.
+    const u64 tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    if (scheduler.CurrentTick() != tick + 1 || scheduler.IsRenderPassActive() ||
+        scheduler.DrawsSinceSubmit() != 0) {
+        static std::atomic<u64> mismatches{};
+        if (const u64 count = mismatches.fetch_add(1, std::memory_order_relaxed) + 1; count <= 64) {
+            LOG_ERROR(Render_Vulkan,
+                      "submit_while_waited: tick {} -> {}, render pass {}, {} draws left after "
+                      "the submit ({} so far)",
+                      tick, scheduler.CurrentTick(), scheduler.IsRenderPassActive(),
+                      scheduler.DrawsSinceSubmit(), count);
+        }
+    }
+    return true;
 }
 
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_,
