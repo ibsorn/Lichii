@@ -62,6 +62,24 @@ namespace {
 constinit thread_local KThread* t_nx2_current_thread = nullptr;
 constinit thread_local u8 t_nx2_host_thread_id = UINT8_MAX;
 
+// Guest threads are fibers that can resume on another host thread. With these plain constinit
+// variables (no TLS wrapper call) clang, and especially ThinLTO after inlining the kernel's
+// accessors into scheduler code, may compute the TLS address once and reuse it across a fiber
+// switch, reading the previous host thread's slot. Every access goes through a call the
+// optimizer cannot inline, so the address is taken on the thread that is running now.
+__declspec(noinline) KThread* Nx2TlsCurrentThread() {
+    return t_nx2_current_thread;
+}
+__declspec(noinline) void Nx2TlsSetCurrentThread(KThread* thread) {
+    t_nx2_current_thread = thread;
+}
+__declspec(noinline) u8 Nx2TlsHostThreadId() {
+    return t_nx2_host_thread_id;
+}
+__declspec(noinline) void Nx2TlsSetHostThreadId(u8 id) {
+    t_nx2_host_thread_id = id;
+}
+
 bool FastTlsEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_FAST_TLS");
@@ -410,14 +428,14 @@ struct KernelCore::Impl {
         // The first four slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
-        t_nx2_host_thread_id = u8(core_id);
+        Nx2TlsSetHostThreadId(u8(core_id));
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
         if (fast_tls) {
-            return t_nx2_host_thread_id;
+            return Nx2TlsHostThreadId();
         }
         return tls_data.host_thread_id;
     }
@@ -471,13 +489,13 @@ struct KernelCore::Impl {
 
     KThread* GetCurrentEmuThread(ThreadLocalData& t) {
         if (fast_tls) {
-            if (KThread* const cached = t_nx2_current_thread; cached != nullptr) [[likely]] {
+            if (KThread* const cached = Nx2TlsCurrentThread(); cached != nullptr) [[likely]] {
                 return cached;
             }
             if (t.current_thread == nullptr) {
                 t.current_thread = GetHostDummyThread(t, nullptr);
             }
-            t_nx2_current_thread = t.current_thread;
+            Nx2TlsSetCurrentThread(t.current_thread);
             return t.current_thread;
         }
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
@@ -485,7 +503,7 @@ struct KernelCore::Impl {
 
     void SetCurrentEmuThread(KThread* thread) {
         tls_data.current_thread = thread;
-        t_nx2_current_thread = thread;
+        Nx2TlsSetCurrentThread(thread);
     }
 
     void DeriveInitialMemoryLayout() {
