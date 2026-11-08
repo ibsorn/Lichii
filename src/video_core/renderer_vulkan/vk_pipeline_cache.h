@@ -227,6 +227,7 @@ private:
     EmissionBudget emission_budget;
 
     GraphicsPipelineCacheKey graphics_key{};
+    u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the program's mask
     GraphicsPipeline* current_pipeline{};
     /// EDEN_NX2_PIPE_SKIP: the pipeline graphics_key was last resolved to, and what its state
     /// was refreshed from. While both stand, a draw reuses it without a refresh or lookup.

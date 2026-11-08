@@ -41,6 +41,7 @@
 #include "video_core/nx2_bindmemo_stats.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -838,6 +839,18 @@ void PipelineCache::SaveUsedPipelines() {
     }
 }
 
+namespace {
+/// EDEN_NX2_ATTR_MASK=0: pipeline keys keep the types of every vertex attribute register, also
+/// those the vertex program never reads (Lichii #408).
+bool AttributeMaskEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ATTR_MASK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     namespace Memo = VideoCommon::Nx2BindMemo;
     using Stat = Memo::Stat;
@@ -863,6 +876,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     // with the same shaders too, so does the pipeline the last lookup found for it.
     const bool skip = PipelineSkipEnabled();
     bool state_same = false;
+    // EDEN_NX2_ATTR_MASK: the key holds the attribute types masked by the program's reads; the
+    // watch, the patch and Refresh work on the unmasked types, masked again below.
+    const bool attribute_mask =
+        dynamic_features.has_dynamic_vertex_input && AttributeMaskEnabled();
+    if (attribute_mask) {
+        graphics_key.state.attribute_types = vertex_attribute_types;
+    }
     // EDEN_NX2_PIPE_PATCH: blending or attribute types alone moved: redo only those parts.
     PipelineStateWatch::Patch patch{};
     if (skip) {
@@ -894,6 +914,21 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         if (skip) {
             state_watch.Store(*maxwell3d, dynamic_features);
         }
+    }
+    if (attribute_mask) {
+        // Types of attributes the program doesn't read would split its pipelines by whatever the
+        // game left in those registers (Ocarina of Time: up to 20 keys for the same shaders).
+        vertex_attribute_types = graphics_key.state.attribute_types;
+        std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
+        for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+            if (graphics_key.unique_hashes[stage] != 0 && shader_infos[stage] != nullptr) {
+                attribute_masks[stage] = shader_infos[stage]->vertex_attribute_mask;
+            } else {
+                attribute_masks[stage] = ~u64{0};
+            }
+        }
+        graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+            vertex_attribute_types, graphics_key.unique_hashes, attribute_masks);
     }
     key_pipeline = nullptr;
 
