@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -14,6 +15,7 @@
 
 #include "common/bit_util.h"
 #include "common/common_types.h"
+#include "common/thread.h"
 
 namespace Tegra {
 
@@ -374,6 +376,35 @@ inline std::array<std::atomic<u32>, Nx2LandedSlots> g_nx2_semaphore_landed{};
            (Nx2LandedSlots - 1);
 }
 
+/// pending_wake (EDEN_NX2_PENDING_WAKE, read once, on unless "0"): the GPU thread's sleep while
+/// a channel waits on an acquire ends at once when a command is queued (PushCommand) or a GPU
+/// release latches a waiter (Nx2SemaphoreWaiters::OnWrite). The sleep's timeout bounds a missed
+/// wake (a CPU release in guest memory still waits for it). Ported from
+/// A-Man-With-A-Plan-dev/Eglantine 94424afdbd.
+namespace Nx2PendingWake {
+inline bool On() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_PENDING_WAKE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+inline Common::Event wake_event;
+inline std::atomic<bool> front_sleeping{};
+inline std::atomic<u64> push_seq{};
+inline std::atomic<u64> latch_seq{};
+
+/// Bumps `seq`, then wakes the GPU thread if it sleeps. The GPU thread sets front_sleeping
+/// before it re-reads the counters (both seq_cst): it sees the bump or this sees the flag.
+inline void Wake(std::atomic<u64>& seq) {
+    seq.fetch_add(1, std::memory_order_seq_cst);
+    if (front_sleeping.load(std::memory_order_seq_cst)) {
+        wake_event.Set();
+    }
+}
+} // namespace Nx2PendingWake
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
@@ -420,11 +451,18 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    latched = true;
+                }
             }
+        }
+        if (latched && Nx2PendingWake::On()) {
+            Nx2PendingWake::Wake(Nx2PendingWake::latch_seq);
         }
     }
 

@@ -25,6 +25,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -42,6 +43,20 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
         std::scoped_lock lk{state.write_lock};
         state.cv.notify_all();
     }
+}
+
+/// pending_wake's form of the pending-channel sleep: ends early on a command queued or a latch
+/// since the poll that saw `push_seen` and `latch_seen`, else after `timeout`.
+void PendingWakeSleep(u64 push_seen, u64 latch_seen, std::chrono::nanoseconds timeout) {
+    namespace Wake = Tegra::Nx2PendingWake;
+    Wake::wake_event.Reset();
+    Wake::front_sleeping.store(true, std::memory_order_seq_cst);
+    if (Wake::push_seq.load(std::memory_order_seq_cst) == push_seen &&
+        Wake::latch_seq.load(std::memory_order_seq_cst) == latch_seen) {
+        // Windows: an OS sleep on a high-resolution timer that Set ends at once.
+        static_cast<void>(Wake::wake_event.BlockFor(timeout));
+    }
+    Wake::front_sleeping.store(false, std::memory_order_seq_cst);
 }
 
 } // Anonymous namespace
@@ -76,10 +91,18 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        const bool pending_wake = Tegra::Nx2PendingWake::On();
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
+                // pending_wake: the sleep below ends early on what comes after this poll.
+                u64 push_seen{};
+                u64 latch_seen{};
+                if (pending_wake) {
+                    push_seen = Tegra::Nx2PendingWake::push_seq.load(std::memory_order_seq_cst);
+                    latch_seen = Tegra::Nx2PendingWake::latch_seq.load(std::memory_order_seq_cst);
+                }
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;
                 {
@@ -107,6 +130,20 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (pending_wake) {
+                        // A queued command or a latched waiter ends the sleep at once. The
+                        // timeout stands in for the sleeps below: a CPU release in guest memory
+                        // wakes nothing, so it is seen as soon as before (SleepForOneTick returns
+                        // within one 0.5 ms timer tick, 0.25 ms on average).
+#ifdef _WIN32
+                        constexpr std::chrono::nanoseconds short_sleep{std::chrono::microseconds{250}};
+#else
+                        constexpr std::chrono::nanoseconds short_sleep{std::chrono::microseconds{50}};
+#endif
+                        PendingWakeSleep(push_seen, latch_seen,
+                                         waited < std::chrono::seconds{2}
+                                             ? short_sleep
+                                             : std::chrono::nanoseconds{std::chrono::milliseconds{1}});
                     } else if (waited < std::chrono::seconds{2}) {
 #ifdef _WIN32
                         // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
@@ -237,6 +274,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    if (Tegra::Nx2PendingWake::On()) {
+        Tegra::Nx2PendingWake::Wake(Tegra::Nx2PendingWake::push_seq);
+    }
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
