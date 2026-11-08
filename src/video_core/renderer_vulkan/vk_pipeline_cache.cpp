@@ -1418,7 +1418,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
+    constexpr u64 EvictAfterFrames = 100000; // Mario: was 9000 (~5 min); keep a big cache resident
     if (frame_count <= EvictAfterFrames) {
         return;
     }
