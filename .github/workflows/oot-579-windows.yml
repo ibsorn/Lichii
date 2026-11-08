@@ -1,0 +1,128 @@
+name: oot-579-windows
+
+# Windows MSVC Release build of the Ocarina of Time branch (mariohbd/Lichii claude/oot-build at
+# eb74c32b2, the working "Ocarina of Time build v1") with zortos293/Lichii#579 applied on top.
+# MSVC, not clang-cl + ThinLTO: the #717 work is known to hang at boot in ThinLTO builds, and the
+# build this replaces was an MSVC one.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - oot-579
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oot-579-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: windows-x86_64-msvc
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 3G
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install sccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Verify Vulkan tools
+        shell: pwsh
+        run: glslangValidator --version
+
+      - name: Restore CPM downloads
+        uses: actions/cache@v5
+        with:
+          path: .cache/cpm
+          key: cpm-oot579-windows-msvc-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt') }}
+          restore-keys: cpm-oot579-windows-msvc-
+
+      - name: Restore compiler objects
+        uses: actions/cache@v5
+        with:
+          path: .sccache
+          key: objects-oot579-windows-msvc-${{ github.sha }}
+          restore-keys: objects-oot579-windows-msvc-
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DLICHII_BUILD_TAG=oot-579-${{ github.run_number }} \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DCMAKE_C_COMPILER=cl \
+            -DCMAKE_CXX_COMPILER=cl \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+
+      - name: Build
+        shell: bash
+        run: |
+          sccache --zero-stats || true
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          sccache --show-stats || true
+
+      - name: Stop sccache
+        if: always()
+        shell: pwsh
+        run: sccache --stop-server
+
+      - name: Package
+        shell: pwsh
+        run: |
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$exe")) { throw "build/release/bin/$exe was not produced" }
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+          Copy-Item dist/nx2_switches.txt build/release/bin/ -ErrorAction SilentlyContinue
+          Get-ChildItem build/release/bin -Filter *.pdb -Recurse | Remove-Item -Force
+          Get-ChildItem build/release/bin | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-oot-579-windows-x86_64-msvc
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 14
