@@ -77,8 +77,15 @@ bool OotEnvSwitch(const char* name, bool default_on) {
     return value[0] != '0';
 }
 
+/// EDEN_NX2_OOT_FPS_UNLOCK=1 applies "FPS Unlock (built-in)" (Lichii #655). Off by default: a
+/// guest panic about 2.5 minutes in went away with it off, and Dynamic FPS applies instead.
+bool OotFpsUnlockEnabled() {
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_FPS_UNLOCK", false);
+    return enabled;
+}
+
 bool OotOcclusionOffEnabled() {
-    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_OCCLUSION_OFF", true);
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_OCCLUSION_OFF", false);
     return enabled;
 }
 
@@ -285,6 +292,7 @@ constexpr std::array BUILTIN_PATCHES{
         .records = FPS_UNLOCK_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
+        .env_enabled = OotFpsUnlockEnabled,
         .replaces = "Dynamic FPS by Dark (built-in)",
     },
     BuiltinPatch{
@@ -1494,7 +1502,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
         // user mod can make it skip), hence "when it applies".
         const auto replacing = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& other) {
             return other.title_id == title_id && other.replaces == patch.name &&
-                   !is_disabled(other.name);
+                   !is_disabled(other.name) &&
+                   (other.env_enabled == nullptr || other.env_enabled());
         });
         out.push_back({.enabled = !is_disabled(patch.name),
                        .name = std::string{patch.name},
