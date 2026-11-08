@@ -1,97 +1,112 @@
-<!--
-# SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
-# SPDX-License-Identifier: GPL-3.0-or-later
+# Lichii: Ocarina of Time build
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
-# SPDX-License-Identifier: GPL-2.0-or-later
--->
+An unofficial build of the [Lichii](https://github.com/zortos293/Lichii) emulator, tuned for
+**The Legend of Zelda: Ocarina of Time** on Switch 2 (`0400486024DEC000`, `main` build
+`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`).
 
-<p align="center">
-  <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
-</p>
+It was put together and tested on a Ryzen 5 5600X, RTX 3060 Ti 8 GB and a 3440x1440 monitor. It is
+not affiliated with Nintendo or with the Lichii project. No game files, keys or firmware are
+included: use only a copy of the game and system files you obtained legally.
 
-# Lichii
+**[Download the latest release](https://github.com/mariohbd/Lichii/releases/latest)**
 
-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
+The original Lichii README is in [README-LICHII.md](README-LICHII.md).
 
-This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
+---
 
-Visit the [official Lichii website](https://lichii.zortos.me) to find games and compare community compatibility reports.
+## What this build changes
 
-## Downloads and setup
+### Visual fixes
 
-Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+| Problem | Fix | Source |
+| --- | --- | --- |
+| Water flickers every other frame (Lake Hylia, Zora's River) | The water shader reads a light's texture handle per pixel. The translation fell back to a buffer address the game swaps every frame, so the texture changed every frame. Such a handle now binds no texture. | [#778](https://github.com/zortos293/Lichii/pull/778), from Frizti's [Fritchii](https://github.com/Frizti/Fritchii) |
+| Blown-out white lights on the walls in Gerudo Valley | FMZ is applied before SAT in FFMA and HFMA2, and half-precision FMZ is translated. | [#811](https://github.com/zortos293/Lichii/pull/811) |
+| White lights and lower FPS with "Occlusion Off" | The built-in is off by default. | this build |
+| Red line in the Royal Family's Tomb | Noperspective varyings are interpolated perspective-correct. | [#820](https://github.com/zortos293/Lichii/pull/820) |
+| Textures left without memory when VRAM runs out | Creating such an image now fails, instead of leaving it without memory. | [#880](https://github.com/zortos293/Lichii/pull/880) |
 
-On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
+### Stability
 
-### Existing saves and settings
+- **Game panic about 2.5 minutes in.** "FPS Unlock (built-in)" ([#655](https://github.com/zortos293/Lichii/pull/655))
+  was the likely cause, so it is **off by default**. "Dynamic FPS by Dark" applies instead, as in
+  earlier builds.
+- Movie video stays in sync with its audio (imports [#571](https://github.com/zortos293/Lichii/pull/571)).
+- The DMA pusher's fence thread no longer overwrites `dma_increment_once`. The vi2 and nifm commands
+  the game calls are stubbed ([#727](https://github.com/zortos293/Lichii/pull/727)).
+- A texture alias's newest tick stays at least as new as each alias's modification, so stale aliases
+  are not skipped.
 
-The rebrand intentionally retains the existing Eden/Eglantine data directories and configuration keys. It does not move or delete saves, settings or shader caches. Back up your saves before testing experimental builds.
+### Performance
 
-## Compatibility and issue reports
+| Change | What it does | Source |
+| --- | --- | --- |
+| Split GPU thread, caches, JIT, kernel work | The main Lichii performance work for this game | [#717](https://github.com/zortos293/Lichii/pull/717) |
+| Host zstd | The emulator decompresses the game's `.zs` files itself, for faster loading | [#869](https://github.com/zortos293/Lichii/pull/869) |
+| NUP zstd on demand | Package members are decoded only as far as reads need | [#885](https://github.com/zortos293/Lichii/pull/885) |
+| Vertex attribute mask | Pipelines are no longer split by vertex attributes the shader never reads, so fewer pipelines are built and there is less stutter | [#408](https://github.com/zortos293/Lichii/pull/408) |
+| No once-a-frame bank upload | Unchanged 64 KiB uniform banks are not uploaded again every frame (about +3% FPS in the author's test) | [#909](https://github.com/zortos293/Lichii/pull/909) |
+| Newest pipelines first | Cached pipelines are prebuilt newest first, which helps after a driver update | [#875](https://github.com/zortos293/Lichii/pull/875), from Fritchii |
+| Submit while waiting, pending wake | The GPU sits idle less | A-Man-With-A-Plan-dev/Eglantine |
+| Alias sync skip | No texture alias sync when no alias changed | 1Shad0w/Lichii |
+| Zen 3 + PGO build | clang-cl, ThinLTO, Lichii's PGO profile and `-march=znver3` | release asset |
 
-Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
+PR #337 (fence-flagged query reports) is left out on purpose. Upstream measured it taking Ocarina
+from about 48 to 32 FPS at GPU accuracy Low.
 
-Browse [community compatibility reports](https://lichii.zortos.me/reports) for results with each player's build and setup.
+### Ultrawide 21:9
 
-Desktop reporting requires a build containing [PR #303](https://github.com/zortos293/Lichii/pull/303) and is not available in build 88. In builds that include it, play and stop a Switch 2 game, then right-click that game and choose **Submit compatibility report**. Only the latest session in the current Lichii process is eligible.
+Ultrawide is not built in. It comes from Ivan0xFF's mod,
+**[craftycorvid/oot-mod](https://github.com/craftycorvid/oot-mod)** (MIT). This build adds one thing
+to it: with the 3440x1440 version of the mod enabled, the hearts and magic sit at the left edge of
+the screen and the item buttons at the right edge, instead of in the centred 16:9
+([#831](https://github.com/zortos293/Lichii/pull/831), commit `e0053016c2`). Menus stay centred.
 
-Confirm the matching website catalog entry and review the editable machine, game, setup, and enabled add-on details prefilled where available. Check the public preview and give explicit consent before submitting. Nothing uploads automatically, and the native v1 reporter does not read or upload logs or files.
+To set it up:
+1. Import the mod's zip under **Properties → Add-Ons → Import Mod from ZIP**.
+2. Set **Graphics → Aspect Ratio → Stretch to Window**.
 
-When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
+---
 
-- The exact build, game version, CPU, GPU and driver version.
-- Relevant settings and steps to reproduce the problem.
-- A screenshot and the log from the affected session, after checking it for personal information.
+## Installing
 
-Do not upload game files, keys, firmware or private account information.
+1. Extract the whole zip and run `lichii.exe`.
+2. Optional: copy `recommended-config/user` next to `lichii.exe` to use the per-game settings this
+   build was tested with: docked, GPU accuracy Low and 12 GB of emulated memory, without ultrawide
+   or frame generation. See `recommended-config/LEIA-ME.txt`.
 
-## Building and contributing
+There are two builds:
 
-See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
+| File | CPU |
+| --- | --- |
+| `lichii-oot-mario-windows-x86_64-msvc.zip` | Any x86-64 CPU |
+| `lichii-oot-mario-windows-x86_64-znver3-pgo.zip` | Ryzen 5000 or newer. It is faster, but it doesn't start on older CPUs |
 
-Keep changes focused and distinguish code-level checks from actual gameplay testing.
+## Switches
 
-## Artwork
-Art created by YOB (yobslab)
-The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
+Each new part can be turned off from `nx2_switches.txt` next to `lichii.exe`. Restart after
+editing it.
 
-## Support Lichii
+| Line | Effect |
+| --- | --- |
+| `EDEN_NX2_WATER_FIX=0` | Uses the old texture binding for the water |
+| `EDEN_NX2_ATTR_MASK=0` | Pipeline keys keep every vertex attribute |
+| `EDEN_NX2_IMAGE_MAY_FAIL=0` | An image that doesn't fit is created without memory, as before |
+| `EDEN_NX2_OOT_BANK_SKIP=0` | Uniform banks are uploaded again once a frame |
+| `EDEN_OOT_UW_HUD_EDGES=0` | The HUD stays centred with the ultrawide mod |
+| `EDEN_NX2_OOT_FPS_UNLOCK=1` | Applies "FPS Unlock (built-in)" |
+| `EDEN_NX2_OOT_OCCLUSION_OFF=1` | Applies "Occlusion Off (built-in)" |
 
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
+## Building
 
-**Solana (SOL)**
-```text
-JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
-```
-
-**Ethereum (ETH)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Bitcoin (BTC)**
-```text
-bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
-```
-
-**BNB Smart Chain (BNB)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Polygon**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
-
-> [!NOTE]
-> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
+Build it like Lichii on Windows, with MSVC 2022, the Vulkan SDK and Qt 6.8.3
+(`cmake -G Ninja -DCMAKE_BUILD_TYPE=Release`). The Zen 3 build uses clang-cl 22 with
+`-flto=thin -fprofile-use=lichii-windows.profdata /clang:-march=znver3`.
 
 ## Credits and license
 
-Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
+All of the emulation work belongs to the developers of Lichii, Eglantine, Eden, yuzu and Sudachi,
+and to the authors of each PR above. Every commit on this branch names the PR or fork commit it
+comes from.
 
-See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.
+GPL-3.0-or-later. See [LICENSE.txt](LICENSE.txt).
