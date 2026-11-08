@@ -114,6 +114,7 @@ void BufferCache<P>::TickFrame() {
     }
     runtime.TickFrame(slot_buffers);
     native_indirect_uniforms_this_frame.clear();
+    native_indirect_uniform_ranges_this_frame.Clear();
     bank_pages_this_frame.clear();
     Nx2BufCache::Report();
     if (frame_tick % 256 == 0) {
@@ -1577,27 +1578,56 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const u64 upload_size = (std::min<u64>)(mapped_size, size);
         if (upload_size != 0) {
+            // Banks are keyed by the bytes they cover, not their start address: Ocarina of Time
+            // binds thousands of overlapping 64 KiB windows a frame (one per draw in Hyrule Castle
+            // Town), and uploading each window whole copied ~64 KiB per draw. Upload only the
+            // parts no other bank uploaded this frame (Lichii #802).
+            const auto upload_parts = [&] {
+                if (Nx2Perf::Verify()) {
+                    native_indirect_uniform_ranges_this_frame.Subtract(device_addr, upload_size);
+                }
+                boost::container::small_vector<BufferCopy, 4> copies;
+                u64 total_size = 0;
+                u64 largest_copy = 0;
+                const auto add_copy = [&](DAddr begin, DAddr end) {
+                    const u64 copy_size = end - begin;
+                    copies.push_back(BufferCopy{
+                        .src_offset = total_size,
+                        .dst_offset = buffer.Offset(begin),
+                        .size = copy_size,
+                    });
+                    total_size += copy_size;
+                    largest_copy = (std::max)(largest_copy, copy_size);
+                };
+                DAddr cursor = device_addr;
+                const DAddr upload_end = device_addr + upload_size;
+                native_indirect_uniform_ranges_this_frame.ForEachInRange(
+                    device_addr, upload_size, [&](DAddr covered_begin, DAddr covered_end) {
+                        if (covered_begin > cursor) {
+                            add_copy(cursor, covered_begin);
+                        }
+                        cursor = (std::max)(cursor, covered_end);
+                    });
+                if (cursor < upload_end) {
+                    add_copy(cursor, upload_end);
+                }
+                if (!copies.empty()) {
+                    native_indirect_uniform_ranges_this_frame.Add(device_addr, upload_size);
+                    UploadMemory(buffer, total_size, largest_copy,
+                                 std::span<BufferCopy>(copies.data(), copies.size()));
+                }
+            };
             if constexpr (USE_MEMORY_MAPS && USE_MEMORY_MAPS_FOR_UPLOADS) {
                 if (Nx2BufCache::g_bank_shadow) {
                     UploadNativeBank(buffer, device_addr, upload_size);
                 } else {
-                    std::array<BufferCopy, 1> copies{BufferCopy{
-                        .src_offset = 0,
-                        .dst_offset = buffer.Offset(device_addr),
-                        .size = upload_size,
-                    }};
-                    UploadMemory(buffer, upload_size, upload_size, copies);
+                    upload_parts();
                     InvalidateHotShadows(device_addr, upload_size);
                     Nx2BufCache::Note(Nx2BufCache::Stat::BankUpload);
                     Nx2BufCache::Note(Nx2BufCache::Stat::BankUploadBytes, upload_size);
                 }
             } else {
-                std::array<BufferCopy, 1> copies{BufferCopy{
-                    .src_offset = 0,
-                    .dst_offset = buffer.Offset(device_addr),
-                    .size = upload_size,
-                }};
-                UploadMemory(buffer, upload_size, upload_size, copies);
+                upload_parts();
                 InvalidateHotShadows(device_addr, upload_size);
             }
         }

@@ -497,6 +497,7 @@ public:
     bool nx2_gpu_ranges_unmarked = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     Nx2BufCache::FrameAddressSet native_indirect_uniforms_this_frame;
+    Common::RangeSet<DAddr> native_indirect_uniform_ranges_this_frame;
 
     /// EDEN_NX2_REACTIVE_ASYNC_FLUSH: queues the GPU-written parts of a range for download at the
     /// next fence instead of flushing them now. Returns whether anything was queued.
