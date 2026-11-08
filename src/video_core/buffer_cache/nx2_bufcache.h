@@ -34,6 +34,10 @@ inline const bool g_contig_resolve = EnvOn("EDEN_NX2_BUFCACHE_CONTIG");
 /// bind of the frame even when that bind streams the buffer from guest memory.
 inline const bool g_bank_skip = EnvOn("EDEN_NX2_BUFCACHE_BANK");
 
+/// EDEN_NX2_OOT_BANK_SKIP=0: Ocarina of Time also re-uploads its native uniform banks once a frame
+/// (Lichii #909: a compare against shadows found no page changed behind the tracker).
+inline const bool g_oot_bank_skip = EnvOn("EDEN_NX2_OOT_BANK_SKIP");
+
 /// EDEN_NX2_BUFCACHE_BANKSHADOW=0: that once-a-frame upload copies the whole bank, unchanged
 /// pages included (every such copy of a bank the frame already used ends the render pass).
 inline const bool g_bank_shadow = EnvOn("EDEN_NX2_BUFCACHE_BANKSHADOW");
