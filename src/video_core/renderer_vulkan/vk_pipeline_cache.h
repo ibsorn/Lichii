@@ -153,6 +153,13 @@ private:
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
+    /// shader_build_budget: whether the new graphics pipeline of the current draw is left unbuilt
+    /// this frame (the frame spent its build budget and BuiltPipeline would let the draw be
+    /// skipped while it builds). The draw is skipped; a later frame builds it.
+    [[nodiscard]] bool DeferRuntimeBuild();
+    /// shader_build_budget: charges a run-time build on the GPU thread to this frame's budget.
+    void ChargeRuntimeBuild(std::chrono::steady_clock::time_point begin);
+
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
@@ -259,6 +266,16 @@ private:
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
     std::chrono::steady_clock::time_point used_pipelines_saved{};
+    /// shader_build_budget (EDEN_NX2_SHADER_BUILD_BUDGET, read once, on unless "0"): GPU-thread
+    /// time spent on run-time pipeline builds in frame build_budget_frame, and the budget per
+    /// frame (EDEN_NX2_SHADER_BUDGET_MS, default 24 ms). GPU thread only.
+    bool shader_build_budget{};
+    u64 build_budget_frame{~u64{}};
+    std::chrono::steady_clock::duration build_budget_spent{};
+    std::chrono::steady_clock::time_point build_budget_start{}; ///< Start of the budget window
+    std::chrono::steady_clock::duration build_budget{};
+    u64 deferred_builds{};  ///< Draws skipped over budget since the last log line
+    u64 over_budget_kept{}; ///< New pipelines built over budget: their draws must not be skipped
     void SaveUsedPipelines();
 
     std::filesystem::path vulkan_pipeline_cache_filename;

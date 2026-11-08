@@ -471,6 +471,19 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
       background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+    // Ported from A-Man-With-A-Plan-dev/Eglantine c9b8bb5e52 / e330d49488.
+    shader_build_budget = [] {
+        const char* const value = std::getenv("EDEN_NX2_SHADER_BUILD_BUDGET");
+        return value == nullptr || value[0] != '0';
+    }();
+    build_budget = std::chrono::milliseconds{[] {
+        const char* const value = std::getenv("EDEN_NX2_SHADER_BUDGET_MS");
+        return value != nullptr ? (std::max)(1, std::atoi(value)) : 24;
+    }()};
+    if (shader_build_budget && use_asynchronous_shaders) {
+        LOG_INFO(Render_Vulkan, "Shader build budget: {} ms of run-time pipeline builds per frame",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(build_budget).count());
+    }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1569,12 +1582,87 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 }
 } // Anonymous namespace
 
+namespace {
+/// How a native draw with an unbuilt pipeline is handled now. EDEN_NX2_ASYNC_DISCARD=1 (read once,
+/// logged when on) wins over the native_async_draws setting, which is read per call.
+NativePendingMode NativePendingModeNow() {
+    // EDEN_NX2_ASYNC_DISCARD=1: skip native draws whose pipeline is still building instead of
+    // waiting for it (experimental; the draw may be missing for a frame or more).
+    static const bool discard_native = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        const bool enabled = value != nullptr && value[0] == '1';
+        if (enabled) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines");
+        }
+        return enabled;
+    }();
+    if (discard_native) {
+        return NativePendingMode::Skip;
+    }
+    switch (Settings::values.native_async_draws.GetValue()) {
+    case Settings::NativeAsyncDraws::Bounded:
+        return NativePendingMode::Bounded;
+    case Settings::NativeAsyncDraws::Skip:
+        return NativePendingMode::Skip;
+    default:
+        return NativePendingMode::Wait;
+    }
+}
+} // Anonymous namespace
+
+bool PipelineCache::DeferRuntimeBuild() {
+    if (!shader_build_budget || !use_asynchronous_shaders) {
+        return false;
+    }
+    if (build_budget_frame != frame_count || build_budget_spent < build_budget) {
+        return false;
+    }
+    // No present for a while (a loading screen, off-screen work): a new window, so the skipped
+    // draws can't wait for a frame that doesn't come.
+    if (const auto now = std::chrono::steady_clock::now();
+        now - build_budget_start > std::chrono::milliseconds{100}) {
+        build_budget_start = now;
+        build_budget_spent = {};
+        return false;
+    }
+    // Only a draw BuiltPipeline would skip while its pipeline builds: native draws only with
+    // native_async_draws Bounded or Skip (or EDEN_NX2_ASYNC_DISCARD=1), and of those and the
+    // rest only the ones CanDiscardPendingDraw lets go (small draws without depth wait).
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    const bool native_may_skip = native && NativePendingModeNow() != NativePendingMode::Wait;
+    if ((native && !native_may_skip) ||
+        !CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
+                               draw_state.draw_element_count, draw_state.draw_element_count,
+                               native_may_skip)) {
+        ++over_budget_kept;
+        return false;
+    }
+    ++deferred_builds;
+    return true;
+}
+
+void PipelineCache::ChargeRuntimeBuild(std::chrono::steady_clock::time_point begin) {
+    if (build_budget_frame != frame_count) {
+        build_budget_frame = frame_count;
+        build_budget_start = begin;
+        build_budget_spent = {};
+    }
+    build_budget_spent += std::chrono::steady_clock::now() - begin;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
-        ReportNewPipelineKey(graphics_key);
         pipeline = background_pipelines.Take(graphics_key);
+        // shader_build_budget: past this frame's budget the draw is skipped and the pipeline
+        // translated in a later frame (one prebuilt in the background costs nothing here).
+        if (!pipeline && DeferRuntimeBuild()) {
+            graphics_cache.erase(pair);
+            return nullptr;
+        }
+        ReportNewPipelineKey(graphics_key);
         if (!pipeline) {
             pipeline = CreateGraphicsPipeline();
         }
@@ -1612,6 +1700,16 @@ void PipelineCache::TickFrame() {
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
+        if (deferred_builds != 0 || over_budget_kept != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Shader build budget ({} ms/frame): {} draws skipped and their pipelines "
+                     "built in a later frame in the last {} frames; {} built over budget for "
+                     "draws that must not be skipped",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(build_budget).count(),
+                     deferred_builds, EvictCheckFrames, over_budget_kept);
+            deferred_builds = 0;
+            over_budget_kept = 0;
+        }
     }
 }
 
@@ -1680,36 +1778,9 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    // EDEN_NX2_ASYNC_DISCARD=1: skip native draws whose pipeline is still building instead of
-    // waiting for it (experimental; the draw may be missing for a frame or more).
-    /// Reads EDEN_NX2_ASYNC_DISCARD once and logs when it is on.
-    static const bool discard_native = [] {
-        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value != nullptr && value[0] == '1';
-        if (enabled) {
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines");
-        }
-        return enabled;
-    }();
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
-    // The environment variable wins over the setting; the setting is read per call.
-    NativePendingMode mode = NativePendingMode::Wait;
-    if (native) {
-        switch (Settings::values.native_async_draws.GetValue()) {
-        case Settings::NativeAsyncDraws::Bounded:
-            mode = NativePendingMode::Bounded;
-            break;
-        case Settings::NativeAsyncDraws::Skip:
-            mode = NativePendingMode::Skip;
-            break;
-        default:
-            break;
-        }
-        if (discard_native) {
-            mode = NativePendingMode::Skip;
-        }
-    }
+    const NativePendingMode mode = native ? NativePendingModeNow() : NativePendingMode::Wait;
     // Native draws are judged by the heuristic only when a mode other than Wait is chosen.
     const bool can_discard = CanDiscardPendingDraw(
         native, maxwell3d->regs.zeta_enable != 0, draw_state.draw_element_count,
@@ -2195,6 +2266,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
             }
         }
         ReportRuntimePipeline("Graphics", begin, shaders);
+        ChargeRuntimeBuild(begin);
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
@@ -2251,6 +2323,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
                                           key.unique_hash,
                                           kepler_compute->regs.code_loc.Address() +
                                               kepler_compute->launch_description.program_start));
+        ChargeRuntimeBuild(begin);
     };
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
