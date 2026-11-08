@@ -446,7 +446,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{read_handle(desc, index)};
+            const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                  ? VideoCommon::NULL_TEXTURE_HANDLE
+                                  : read_handle(desc, index)};
             views.push_back({
                 .index = handle.first,
                 .blacklist = blacklist,
