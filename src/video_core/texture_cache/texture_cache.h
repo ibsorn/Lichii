@@ -3710,7 +3710,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 continue;
             }
             CopyImage(new_image_id, aliased->id, aliased->copies);
-            new_image.modification_tick = overlap.modification_tick;
+            SetModificationTick(slot_images, new_image, overlap.modification_tick);
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -3726,7 +3726,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             } else {
                 runtime.CopyImage(new_image, overlap, copies);
             }
-            new_image.modification_tick = overlap.modification_tick;
+            SetModificationTick(slot_images, new_image, overlap.modification_tick);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -4604,10 +4604,7 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     NoteGpuModified(image);
     image.flags |= ImageFlagBits::GpuModified;
-    image.modification_tick = ++modification_tick;
-    for (const AliasedImage& alias : image.aliased_images) {
-        slot_images[alias.id].newest_alias_tick = image.modification_tick;
-    }
+    SetModificationTick(slot_images, image, ++modification_tick);
 }
 
 template <class P>
@@ -4629,6 +4626,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     // Nothing aliased was modified after this image: skip walking its (possibly long) alias list
     // for every draw that samples it (~7% of the GPU back thread in DK Bananza's open areas).
     if (image.newest_alias_tick <= image.modification_tick) {
+        DEBUG_ASSERT(std::ranges::none_of(image.aliased_images, [&](const AliasedImage& alias) {
+            return slot_images[alias.id].modification_tick > image.modification_tick;
+        }));
         return;
     }
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
@@ -4644,6 +4644,8 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     if (aliased_images.empty()) {
+        // Newer aliases were deleted since: skip the walk until one is modified again.
+        image.newest_alias_tick = image.modification_tick;
         return;
     }
     const bool can_rescale = ImageCanRescale(image);
@@ -4654,11 +4656,8 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
             ScaleDown(image);
         }
     }
-    image.modification_tick = most_recent_tick;
-    for (const AliasedImage& alias : image.aliased_images) {
-        ImageBase& other = slot_images[alias.id];
-        other.newest_alias_tick = (std::max)(other.newest_alias_tick, most_recent_tick);
-    }
+    SetModificationTick(slot_images, image, most_recent_tick);
+    image.newest_alias_tick = most_recent_tick;
     if (any_modified) {
         NoteGpuModified(image);
         image.flags |= ImageFlagBits::GpuModified;
