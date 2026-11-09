@@ -43,6 +43,25 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# Occlusion Off (built-in) desligado (padrao desta build)
+EDEN_NX2_OOT_OCCLUSION_OFF=0
+
+
+# PR #259: preflush (Kokiri +FPS, pode dar flicker). Desligar: comente a linha
+EDEN_NX2_PREFLUSH=1
+
+# JIT superblocks (0 = desliga)
+EDEN_DYN_SUPERBLOCK=1
+
+# A-Man ports (0 = desliga)
+EDEN_NX2_SUBMIT_WHILE_WAITED=1
+EDEN_NX2_PENDING_WAKE=1
+
+# #869 zstd no host (0 = desliga)
+EDEN_NX2_OOT_HOST_ZSTD=1
+
+# --- Lichii #579 (shader libraries + warm-up) ---
 # Compute shaders build the functions they call from several places (a native program's global
 # memory functions) as calls instead of inlining them at every call site: NVIDIA spent 2-13 s on
 # single compute shaders of a test title, each a freeze of the whole emulator at its first

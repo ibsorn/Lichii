@@ -1,112 +1,122 @@
-# Lichii: Ocarina of Time build
+# Lichii OoT + shader precache (#717 + #579)
 
-An unofficial build of the [Lichii](https://github.com/zortos293/Lichii) emulator, tuned for
-**The Legend of Zelda: Ocarina of Time** on Switch 2 (`0400486024DEC000`, `main` build
-`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`).
+A Windows build of [Lichii](https://github.com/zortos293/Lichii) for **The Legend of Zelda: Ocarina
+of Time** on Switch 2 (`0400486024DEC000`). It compiles the game's shaders **before** you play, so new
+areas no longer freeze while their shaders build.
 
-It was put together and tested on a Ryzen 5 5600X, RTX 3060 Ti 8 GB and a 3440x1440 monitor. It is
-not affiliated with Nintendo or with the Lichii project. No game files, keys or firmware are
-included: use only a copy of the game and system files you obtained legally.
+It starts from mariohbd's [Ocarina of Time build v1](https://github.com/mariohbd/Lichii/releases/tag/oot-mario-v1)
+(Lichii `nx2` + [#717](https://github.com/zortos293/Lichii/pull/717), the split GPU thread, cache and JIT
+work that helps CPU-bound PCs) and adds [#579](https://github.com/zortos293/Lichii/pull/579): graphics
+pipeline libraries and a shader warm-up built from your own game files.
 
-**[Download the latest release](https://github.com/mariohbd/Lichii/releases/latest)**
+No game files, keys or firmware are included. You need your own legally dumped game and keys.
 
-The original Lichii README is in [README-LICHII.md](README-LICHII.md).
+**Download:** [Releases](https://github.com/ibsorn/Lichii/releases), `lichii-oot-579-windows-x86_64-msvc.zip`.
 
----
+## What changes in play
 
-## What this build changes
+On the test PC (below), same game and settings, first visits to areas:
 
-### Visual fixes
+| | Before (OoT build v1, no libraries) | This build, after the warm-up |
+|---|---|---|
+| Worst 10 s of shader building on the GPU thread | 1,912 ms | 173 ms |
+| Worst 10 s of draws waiting for unbuilt shaders | 2,658 ms | 2 ms |
+| Longest single shader build | 229 ms | 77 ms |
 
-| Problem | Fix | Source |
-| --- | --- | --- |
-| Water flickers every other frame (Lake Hylia, Zora's River) | The water shader reads a light's texture handle per pixel. The translation fell back to a buffer address the game swaps every frame, so the texture changed every frame. Such a handle now binds no texture. | [#778](https://github.com/zortos293/Lichii/pull/778), from Frizti's [Fritchii](https://github.com/Frizti/Fritchii) |
-| Blown-out white lights on the walls in Gerudo Valley | FMZ is applied before SAT in FFMA and HFMA2, and half-precision FMZ is translated. | [#811](https://github.com/zortos293/Lichii/pull/811) |
-| White lights and lower FPS with "Occlusion Off" | The built-in is off by default. | this build |
-| Red line in the Royal Family's Tomb | Noperspective varyings are interpolated perspective-correct. | [#820](https://github.com/zortos293/Lichii/pull/820) |
-| Textures left without memory when VRAM runs out | Creating such an image now fails, instead of leaving it without memory. | [#880](https://github.com/zortos293/Lichii/pull/880) |
+From the emulator log (`ReportRuntimePipeline`). Not a controlled A/B: the "before" is about 5 minutes
+of play, the "after" about 7 minutes in partly different areas. The other #579 testers report the same
+trend (multi-second freezes on first visits gone).
 
-### Stability
+## The first launch takes a while (once)
 
-- **Game panic about 2.5 minutes in.** "FPS Unlock (built-in)" ([#655](https://github.com/zortos293/Lichii/pull/655))
-  was the likely cause, so it is **off by default**. "Dynamic FPS by Dark" applies instead, as in
-  earlier builds.
-- Movie video stays in sync with its audio (imports [#571](https://github.com/zortos293/Lichii/pull/571)).
-- The DMA pusher's fence thread no longer overwrites `dma_increment_once`. The vi2 and nifm commands
-  the game calls are stubbed ([#727](https://github.com/zortos293/Lichii/pull/727)).
-- A texture alias's newest tick stays at least as new as each alias's modification, so stale aliases
-  are not skipped.
+With *Precache shaders before game start* on, the first launch builds every shader it can find in the
+game files on the loading screen:
 
-### Performance
+| Step | On the test PC (8 threads) |
+|---|---|
+| Read the game files and write the warm-up files | 10 s (4,794 compute, 22,594 vertex, 37,402 fragment programs) |
+| Compute shaders | 4,660 built, 0 failed, 4 min |
+| Graphics shader libraries | 59,324 built, 672 failed (0 by the driver), 31 min |
 
-| Change | What it does | Source |
-| --- | --- | --- |
-| Split GPU thread, caches, JIT, kernel work | The main Lichii performance work for this game | [#717](https://github.com/zortos293/Lichii/pull/717) |
-| Host zstd | The emulator decompresses the game's `.zs` files itself, for faster loading | [#869](https://github.com/zortos293/Lichii/pull/869) |
-| NUP zstd on demand | Package members are decoded only as far as reads need | [#885](https://github.com/zortos293/Lichii/pull/885) |
-| Vertex attribute mask | Pipelines are no longer split by vertex attributes the shader never reads, so fewer pipelines are built and there is less stutter | [#408](https://github.com/zortos293/Lichii/pull/408) |
-| No once-a-frame bank upload | Unchanged 64 KiB uniform banks are not uploaded again every frame (about +3% FPS in the author's test) | [#909](https://github.com/zortos293/Lichii/pull/909) |
-| Newest pipelines first | Cached pipelines are prebuilt newest first, which helps after a driver update | [#875](https://github.com/zortos293/Lichii/pull/875), from Fritchii |
-| Submit while waiting, pending wake | The GPU sits idle less | A-Man-With-A-Plan-dev/Eglantine |
-| Alias sync skip | No texture alias sync when no alias changed | 1Shad0w/Lichii |
-| Zen 3 + PGO build | clang-cl, ThinLTO, Lichii's PGO profile and `-march=znver3` | release asset |
+The 672 failures are programs whose state can't be guessed from the files; other #579 testers get the
+same 59,324 / 672 split. They are built during play as usual.
 
-PR #337 (fence-flagged query reports) is left out on purpose. Upstream measured it taking Ocarina
-from about 48 to 32 FPS at GPU accuracy Low.
+Later launches find the work done ("already done for this driver" in the log) and start in about a
+minute. **The warm-up runs again (once) after a GPU driver update**, a different GPU, or a deleted
+shader cache. It needs about 1.7 GB in `%APPDATA%\eden\cache\shader\0400486024dec000` plus about 1 GB
+in the NVIDIA driver cache.
 
-### Ultrawide 21:9
+## Setup
 
-Ultrawide is not built in. It comes from Ivan0xFF's mod,
-**[craftycorvid/oot-mod](https://github.com/craftycorvid/oot-mod)** (MIT). This build adds one thing
-to it: with the 3440x1440 version of the mod enabled, the hearts and magic sit at the left edge of
-the screen and the item buttons at the right edge, instead of in the centred 16:9
-([#831](https://github.com/zortos293/Lichii/pull/831), commit `e0053016c2`). Menus stay centred.
+1. Unzip anywhere and run `lichii.exe`. Settings, keys, saves and caches are shared with Lichii, Eden
+   and other Lichii forks (`%APPDATA%\eden`).
+2. Right-click the game > **Properties** (per-game settings), and set:
 
-To set it up:
-1. Import the mod's zip under **Properties → Add-Ons → Import Mod from ZIP**.
-2. Set **Graphics → Aspect Ratio → Stretch to Window**.
+| Where | Setting | Value |
+|---|---|---|
+| Graphics > Advanced | **Shader libraries (faster first-time shader builds)** | On |
+| Graphics > Advanced | **Precache shaders before game start** | Always |
+| Graphics > Advanced | Switch 2 draws with unbuilt pipelines | Bounded wait (8 ms) |
+| Graphics > Advanced | GPU accuracy | Fast |
+| Graphics | Resolution | 1x |
+| System | Console mode | Docked |
+| Add-Ons | Dynamic FPS by Dark (built-in) | On |
+| Add-Ons | FPS Unlock (built-in) | Off |
+| Graphics | Use NVIDIA DLSS in place of a game's DLSS | Optional (RTX). Needs the Streamline files from the button next to it |
 
----
+3. Start the game and leave the loading screen alone until it finishes (don't press *Skip*).
 
-## Installing
+If you open the game with another Lichii build, that build drops the *Shader libraries* setting it
+doesn't know; turn it on again here.
 
-1. Extract the whole zip and run `lichii.exe`.
-2. Optional: copy `recommended-config/user` next to `lichii.exe` to use the per-game settings this
-   build was tested with: docked, GPU accuracy Low and 12 GB of emulated memory, without ultrawide
-   or frame generation. See `recommended-config/LEIA-ME.txt`.
+## Will it work on my PC?
 
-There are two builds:
+Honest answer: **it has been tested on one PC**. What the code does elsewhere is known; how well it runs
+is not.
 
-| File | CPU |
-| --- | --- |
-| `lichii-oot-mario-windows-x86_64-msvc.zip` | Any x86-64 CPU |
-| `lichii-oot-mario-windows-x86_64-znver3-pgo.zip` | Ryzen 5000 or newer. It is faster, but it doesn't start on older CPUs |
+| | Status |
+|---|---|
+| **Tested** | Intel i7-6700K (4 cores / 8 threads), NVIDIA RTX 3070 8 GB, 32 GB RAM, Windows 11, NVIDIA driver 610.88 |
+| **CPU** | Any x86-64 CPU (plain MSVC build: no AVX-512, no Zen-only code). Ocarina is CPU-bound, so frame rate depends mostly on the CPU (not measured on the test PC); fewer threads also make the warm-up longer |
+| **NVIDIA RTX 20/30/40/50** | Expected to work like the test PC (same driver path) |
+| **NVIDIA GTX 10 (Pascal)** | Untested. Mesh scenes go through compute emulation and keep the old (no-library) path |
+| **AMD Radeon** | Untested here. #579 links libraries optimized on AMD's Windows driver (fix for white fringes). An open report on #717 has RDNA2 (RX 6000) losing the device at save load; RX 6000 and older also skip the matrix-unit path |
+| **Intel Arc / iGPU** | Untested. Libraries turn on only when the driver offers `VK_EXT_graphics_pipeline_library` with fast linking; otherwise they stay off (the log has no `graphics pipeline libraries on` line) and the precache builds only the compute shaders and the already cached pipelines |
+| **RAM** | The emulator used about 8 GB during the warm-up on the test PC; 16 GB or more is advisable |
+| **Linux, macOS, Android** | No builds from this branch |
+
+If it doesn't run well on your hardware, the log (`%APPDATA%\eden\log\eden_log.txt`) shows what
+happened: look for `Nx2Perf gpl`, `Shader precache` and `Runtime pipelines in the last 10 s`.
 
 ## Switches
 
-Each new part can be turned off from `nx2_switches.txt` next to `lichii.exe`. Restart after
-editing it.
+`nx2_switches.txt` beside `lichii.exe` keeps mariohbd's tuning (split GPU thread, preflush, JIT
+superblocks, host zstd, Occlusion Off disabled) and documents #579's: `EDEN_NX2_WARM_THREADS`
+(warm-up threads), `EDEN_NX2_COMPUTE_NOINLINE` / `EDEN_NX2_GRAPHICS_NOINLINE`. `EDEN_NX2_GPL=1` turns
+the libraries on without the setting.
 
-| Line | Effect |
-| --- | --- |
-| `EDEN_NX2_WATER_FIX=0` | Uses the old texture binding for the water |
-| `EDEN_NX2_ATTR_MASK=0` | Pipeline keys keep every vertex attribute |
-| `EDEN_NX2_IMAGE_MAY_FAIL=0` | An image that doesn't fit is created without memory, as before |
-| `EDEN_NX2_OOT_BANK_SKIP=0` | Uniform banks are uploaded again once a frame |
-| `EDEN_OOT_UW_HUD_EDGES=0` | The HUD stays centred with the ultrawide mod |
-| `EDEN_NX2_OOT_FPS_UNLOCK=1` | Applies "FPS Unlock (built-in)" |
-| `EDEN_NX2_OOT_OCCLUSION_OFF=1` | Applies "Occlusion Off (built-in)" |
+## How it was put together
 
-## Building
+- Base: mariohbd/Lichii `claude/oot-build` at `eb74c32b2`, the tree of OoT build v1.
+- #579's own 26 commits (not the `nx2` merges it carries) applied three-way. Ten conflict blocks in six
+  files were resolved by hand, keeping #717's code paths and adding #579's; see the commit message of
+  `4c3372877` for each one.
+- One follow-up: this branch's `FileEnvironment::Deserialize` takes no end bound, so the graphics
+  precache checks the file position itself.
+- Built by [`.github/workflows/oot-579-windows.yml`](.github/workflows/oot-579-windows.yml): Windows,
+  MSVC Release, no ThinLTO (a ThinLTO build of #717 is reported to hang at boot), update checker off so
+  it doesn't replace itself with an upstream Lichii build.
 
-Build it like Lichii on Windows, with MSVC 2022, the Vulkan SDK and Qt 6.8.3
-(`cmake -G Ninja -DCMAKE_BUILD_TYPE=Release`). The Zen 3 build uses clang-cl 22 with
-`-flto=thin -fprofile-use=lichii-windows.profdata /clang:-march=znver3`.
+## Credits
 
-## Credits and license
+All of the emulation work is other people's: the [Lichii](https://github.com/zortos293/Lichii), Eden
+and yuzu developers; mariohbd for the OoT build; stephenjayakar for #717; PantACRO4life for #579, with
+daniel-lynch, justin-wq1337, jarynclouatre and the other contributors named in its commits.
+Dynamic FPS by Dark.
 
-All of the emulation work belongs to the developers of Lichii, Eglantine, Eden, yuzu and Sudachi,
-and to the authors of each PR above. Every commit on this branch names the PR or fork commit it
-comes from.
+mariohbd's README for OoT build v1 is in [README-OOT-MARIO.md](README-OOT-MARIO.md), Lichii's in
+[README-LICHII.md](README-LICHII.md).
 
-GPL-3.0-or-later. See [LICENSE.txt](LICENSE.txt).
+## License
+
+GPL-3.0-or-later, like Lichii, Eden and yuzu. See [LICENSE.txt](LICENSE.txt).
