@@ -100,7 +100,8 @@ jobs:
         shell: bash
         run: |
           sccache --zero-stats || true
-          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          # -k 0: keep going after a failure so one run reports every compile error.
+          cmake --build build/release --target yuzu yuzu-cmd --parallel -- -k 0
           sccache --show-stats || true
 
       - name: Stop sccache

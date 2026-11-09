@@ -1548,8 +1548,18 @@ size_t PipelineCache::PrecacheGraphicsWarm(u64 title_id, size_t num_threads, siz
                                 reader.failed = true;
                                 break;
                             }
-                            env.Deserialize(reader.file, reader.end);
+                            // This branch's FileEnvironment::Deserialize has no end bound
+                            // (nx2's does): check the position after the entry instead.
+                            env.Deserialize(reader.file);
                             reader.file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                            if (!reader.file || std::streamoff{reader.file.tellg()} >
+                                                       std::streamoff{reader.end}) {
+                                LOG_WARNING(Render_Vulkan,
+                                            "Shader precache: graphics entry past the end, "
+                                            "stopping");
+                                reader.failed = true;
+                                break;
+                            }
                             ++reader.read;
                             reader.position = reader.file.tellg();
                         } catch (const std::exception& e) {
